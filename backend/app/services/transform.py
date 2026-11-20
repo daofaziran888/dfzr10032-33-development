@@ -7,6 +7,7 @@ from app.store import store
 
 MODULE = "transform"
 REQUIRED_FIELDS = ["节点编号", "输入来源", "输出目标"]
+OPTIONAL_FIELDS = ["转换表达式", "执行顺序", "依赖节点", "失败策略"]
 STATUS_ORDER = ["草稿", "待校验", "已启用", "已停用"]
 ACTION_RULES = {"提交校验": "待校验", "启用节点": "已启用", "停用节点": "已停用"}
 NEGATIVE_ACTIONS = ["停用节点"]
@@ -44,6 +45,9 @@ class TransformService:
         rows = store.rows(MODULE)
         entry = {"id": max((int(row.get("id", 0)) for row in rows), default=0) + 1}
         entry.update({field: values.get(field) for field in REQUIRED_FIELDS})
+        for field in OPTIONAL_FIELDS:
+            entry[field] = values.get(field)
+        entry["节点状态"] = values.get("节点状态") or "已启用"
         entry["status"] = STATUS_ORDER[0]
         entry["pending"] = True
         entry["abnormal"] = False

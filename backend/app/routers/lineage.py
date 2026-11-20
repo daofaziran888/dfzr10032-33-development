@@ -1,4 +1,8 @@
-"""数据血缘追踪接口：维护血缘关系，覆盖记录关系、验证关系、归档关系等动作。"""
+"""数据血缘追踪接口：维护血缘关系，覆盖记录关系、验证关系、归档关系等动作。
+
+除人工登记的关系外，转换执行会把“输入字段版本 → 输出字段版本”的对应关系写进同一张
+血缘表；这里的查询接口用来从已确认结果反查原始字段，或按字段版本定位影响范围。
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -7,10 +11,12 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.schemas import ActionResult, EntryPayload, PageResult
 from app.services.lineage import LineageService
+from app.services.transform_pipeline import PipelineError, TransformPipelineService
 
 router = APIRouter(prefix="/api/lineage", tags=["数据血缘追踪"])
 
 service = LineageService()
+pipeline = TransformPipelineService()
 
 LIST_FIELDS = ["关系编号", "上游节点", "下游节点", "来源字段", "目标字段", "转换说明", "采集批次", "关系版本"]
 STATUSES = ["草稿", "已记录", "已验证", "已归档"]
@@ -37,6 +43,40 @@ def list_entries(
     extra = {k: v for k, v in request.query_params.items() if k not in ("keyword", "status", "page", "size") and v.strip()}
     items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size, extra=extra)
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/relations", response_model=PageResult[dict])
+def list_relations(
+    result: str | None = Query(default=None, description="按结果编号过滤"),
+    batch: str | None = Query(default=None, description="按数据批次过滤"),
+    node: str | None = Query(default=None, description="按上游或下游节点过滤"),
+    field: str | None = Query(default=None, description="按来源或目标字段过滤"),
+    field_version: str | None = Query(default=None, description="按来源字段版本定位影响范围"),
+    page: int = 1,
+    size: int = 50,
+) -> PageResult[dict]:
+    """查询执行期持久化的字段版本关系，可按结果、批次、节点、字段版本筛选。"""
+    if size > 200:
+        raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
+    items, total = pipeline.list_lineage(
+        result=result,
+        batch=batch,
+        node=node,
+        field=field,
+        field_version=field_version,
+        page=page,
+        size=size,
+    )
+    return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/trace/{result_number}", response_model=dict)
+def trace_result(result_number: str, field: str | None = None) -> dict[str, Any]:
+    """从已确认结果向上追溯，一直到最初的输入字段版本。"""
+    try:
+        return pipeline.trace(result_number, field=field)
+    except PipelineError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/{entry_id}", response_model=dict)

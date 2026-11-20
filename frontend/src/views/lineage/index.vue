@@ -60,6 +60,83 @@
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
 
+    <section class="panel">
+      <header class="panel-head">
+        <div>
+          <h3>转换血缘</h3>
+          <p class="page-desc">
+            转换执行会把“输入字段版本 → 输出字段版本”的关系写进血缘表；这里可以从已确认结果反查原始字段，
+            或按字段版本定位受影响的结果。
+          </p>
+        </div>
+        <div class="panel-actions">
+          <label class="inline-field">
+            <span>追溯结果编号</span>
+            <input v-model="traceNumber" placeholder="例如 RES-0009" />
+          </label>
+          <button class="btn primary" type="button" @click="runTrace">追溯原始字段</button>
+        </div>
+      </header>
+
+      <form class="filter-bar" @submit.prevent="reloadRelations">
+        <label class="filter-item">
+          <span>数据批次</span>
+          <input v-model="relationFilters.batch" placeholder="例如 BATCH-002" />
+        </label>
+        <label class="filter-item">
+          <span>节点编号</span>
+          <input v-model="relationFilters.node" placeholder="例如 TRAN-KG" />
+        </label>
+        <label class="filter-item">
+          <span>字段版本</span>
+          <input v-model="relationFilters.field_version" placeholder="例如 D-0001-重量克-v2" />
+        </label>
+        <button class="btn" type="submit">查询关系</button>
+        <button class="btn ghost" type="button" @click="resetRelations">重置条件</button>
+      </form>
+
+      <p v-if="traceNote" class="panel-note">{{ traceNote }}</p>
+      <ul v-if="traceLines.length" class="trace-tree">
+        <li v-for="(line, index) in traceLines" :key="index" :style="{ paddingLeft: `${line.depth * 18}px` }">
+          <span class="trace-node">{{ line.downstream }} ← {{ line.upstream || '原始输入' }}</span>
+          <span class="trace-field">{{ line.sourceField }}（{{ line.sourceVersion || '—' }}）→ {{ line.targetField }}</span>
+          <span class="trace-meta">{{ line.batch }} · {{ line.resultNumber }}</span>
+        </li>
+      </ul>
+
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>关系编号</th>
+            <th>结果编号</th>
+            <th>上游节点</th>
+            <th>下游节点</th>
+            <th>来源字段</th>
+            <th>来源字段版本</th>
+            <th>目标字段</th>
+            <th>输出字段版本</th>
+            <th>数据批次</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="item in relations" :key="String(item.id)">
+            <td>{{ item.关系编号 }}</td>
+            <td>{{ item.结果编号 }}</td>
+            <td>{{ item.上游节点 }}</td>
+            <td>{{ item.下游节点 }}</td>
+            <td>{{ item.来源字段 }}</td>
+            <td class="version-cell">{{ item.来源字段版本 || '—' }}</td>
+            <td>{{ item.目标字段 }}</td>
+            <td class="version-cell">{{ item.输出字段版本 || '—' }}</td>
+            <td>{{ item.数据批次 }}</td>
+          </tr>
+          <tr v-if="!relations.length">
+            <td colspan="9" class="empty-state">还没有执行期血缘关系，先到采集转换管道执行一次转换</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
     <Teleport to="body">
       <div v-if="showCreateModal" class="modal-overlay" @click.self="showCreateModal = false">
         <div class="modal-card">
@@ -86,7 +163,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 
-import { request } from '@/api/client'
+import { fetchJson, request } from '@/api/client'
 
 type Row = Record<string, string | number | null>
 
@@ -103,6 +180,23 @@ const filters = ref<Record<string, string>>({})
 const filterFields = columns.slice(0, 3)
 const showCreateModal = ref(false)
 const createFields = ref<Record<string, string>>({})
+
+const relations = ref<Row[]>([])
+const relationFilters = ref<Record<string, string>>({})
+const traceNumber = ref('')
+const traceNote = ref('')
+const traceLines = ref<TraceLine[]>([])
+
+type TraceLine = {
+  depth: number
+  upstream: string
+  downstream: string
+  sourceField: string
+  sourceVersion: string
+  targetField: string
+  batch: string
+  resultNumber: string
+}
 
 function updateStats() {
   const data = rows.value
@@ -177,5 +271,146 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+async function reloadRelations() {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(relationFilters.value)) {
+    if (value) params.set(key, value)
+  }
+  try {
+    const payload = await fetchJson<{ items: Row[] }>(
+      `${ENDPOINT}/relations?${params.toString()}`,
+    )
+    relations.value = payload.items ?? []
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '执行期血缘关系读取失败'
+  }
+}
+
+function resetRelations() {
+  relationFilters.value = {}
+  void reloadRelations()
+}
+
+type TraceSource = {
+  relation?: Record<string, string>
+  upstream?: TraceSource[]
+}
+
+function flattenTrace(sources: TraceSource[], depth = 0): TraceLine[] {
+  const flat: TraceLine[] = []
+  for (const source of sources ?? []) {
+    const relation = source.relation ?? {}
+    flat.push({
+      depth,
+      upstream: relation.上游节点,
+      downstream: relation.下游节点,
+      sourceField: relation.来源字段,
+      sourceVersion: relation.来源字段版本,
+      targetField: relation.目标字段,
+      batch: relation.数据批次,
+      resultNumber: relation.结果编号,
+    })
+    flat.push(...flattenTrace(source.upstream ?? [], depth + 1))
+  }
+  return flat
+}
+
+async function runTrace() {
+  traceNote.value = ''
+  traceLines.value = []
+  const number = traceNumber.value.trim()
+  if (!number) {
+    traceNote.value = '请输入要追溯的结果编号'
+    return
+  }
+  try {
+    const payload = await fetchJson<{ result: Row; sources: TraceSource[] }>(
+      `${ENDPOINT}/trace/${encodeURIComponent(number)}`,
+    )
+    traceLines.value = flattenTrace(payload.sources)
+    traceNote.value = `结果 ${payload.result.结果编号} 为已确认结果，共 ${traceLines.value.length} 条字段版本关系`
+  } catch (error) {
+    traceNote.value = error instanceof Error ? error.message : '血缘追溯失败'
+  }
+}
+
+onMounted(() => {
+  void reload()
+  void reloadRelations()
+})
 </script>
+
+<style scoped>
+.panel {
+  margin-top: 18px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+.panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.panel-head h3 {
+  margin: 0;
+  font-size: 15px;
+}
+.panel-actions {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+.inline-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.inline-field input {
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+}
+.panel-note {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.version-cell {
+  font-size: 12px;
+  color: #334155;
+  word-break: break-all;
+}
+.trace-tree {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  font-size: 13px;
+}
+.trace-tree li {
+  padding: 5px 0;
+  border-top: 1px dashed var(--border);
+}
+.trace-tree li:first-child {
+  border-top: none;
+}
+.trace-node {
+  font-weight: 600;
+  margin-right: 10px;
+}
+.trace-field {
+  color: #334155;
+  margin-right: 10px;
+}
+.trace-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+</style>
